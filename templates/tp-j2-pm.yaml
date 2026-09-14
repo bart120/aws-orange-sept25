@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  J2 APRES-MIDI - Performance & observabilite avancee.
+  Cette stack introduit le probleme de performance : elle cree les parametres
+  de pilotage que la chaine BSS relit toutes les dix secondes. Tant qu'ils
+  n'existent pas, la chaine tourne en regime nominal ; des leur creation, la
+  mediation ralentit et la facturation echoue.
+  Le stagiaire lit le Service Map, trouve l'appel lent et la cause racine.
+  Duree de deploiement : environ 1 minute. Effet visible en moins d'une minute.
+
+  Les prerequis d'execution - file SQS, role et identite de pod - sont dans
+  la stack socle tp-j1-am : la chaine doit fonctionner des le J1 apres-midi.
+
+Parameters:
+
+  StackSocle:
+    Type: String
+    Default: tp-j1-am
+    Description: Nom de la stack socle deployee au J1 matin.
+
+  LatenceMediationMs:
+    Type: Number
+    Default: 1800
+    MinValue: 0
+    MaxValue: 10000
+    Description: >
+      Latence injectee dans le service de mediation, en millisecondes.
+      1800 ms cree un goulet visible sans rendre la chaine inutilisable.
+
+  TauxErreurFacturation:
+    Type: Number
+    Default: 15
+    MinValue: 0
+    MaxValue: 100
+    Description: >
+      Pourcentage d'appels a la facturation qui renvoient une erreur 500.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Les quatre leviers du formateur
+  #
+  # Les pods relisent ces parametres toutes les dix secondes. Les modifier
+  # dans Systems Manager change le comportement de la chaine en moins d'une
+  # minute, sans redeploiement : c'est ce qui permet de declencher un
+  # incident devant le groupe, au moment choisi.
+  # ------------------------------------------------------------------
+
+  ParamLatenceMediation:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/mediation/latence-ms'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: !Ref LatenceMediationMs
+      Description: Latence artificielle du service de mediation.
+
+  ParamTauxErreurFacturation:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/facturation/taux-erreur'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: !Ref TauxErreurFacturation
+      Description: Pourcentage d'erreurs 500 renvoyees par la facturation.
+
+  ParamChargeCpu:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/provisioning/charge-cpu'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: '0'
+      Description: >-
+        Intensite de la charge CPU du provisioning, de 0 a 100.
+        Reste a 0 au J2 ; passe a 85 pour l'atelier final du J3.
+
+  ParamAuthAnormale:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/idm/auth-anormale'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: 'false'
+      Description: >-
+        Active la generation de tentatives d'authentification anormales dans
+        les logs de l'IDM. Reste a false au J2 ; passe a true au J3.
+
+  # ------------------------------------------------------------------
+  # Canal de notification de la demi-journee
+  # Les alarmes de latence et de profondeur de file y seront branchees
+  # par le stagiaire.
+  # ------------------------------------------------------------------
+
+  RubriquePerformance:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - 'bss-alertes-performance-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      DisplayName: Alertes performance BSS
+
+Outputs:
+
+  EtatChaine:
+    Description: Comportement de la chaine apres deploiement de cette stack.
+    Value: !Sub 'Mediation ralentie de ${LatenceMediationMs} ms, facturation en echec sur ${TauxErreurFacturation} pour cent des appels.'
+
+  NomFileFacturation:
+    Description: >
+      Dimension QueueName a utiliser dans les metriques CloudWatch SQS,
+      notamment ApproximateAgeOfOldestMessage.
+    Value: !ImportValue
+      Fn::Sub: '${StackSocle}-NomFileFacturation'
+
+  RubriquePerformanceArn:
+    Value: !Ref RubriquePerformance
+    Export:
+      Name: !Sub '${AWS::StackName}-RubriquePerformance'
+
+  ParametresDePilotage:
+    Description: >
+      Les quatre leviers, modifiables dans Systems Manager > Parameter Store.
+    Value: !Sub
+      - '/bss/${Suffixe}/mediation/latence-ms, /bss/${Suffixe}/facturation/taux-erreur, /bss/${Suffixe}/provisioning/charge-cpu, /bss/${Suffixe}/idm/auth-anormale'
+      - Suffixe: !ImportValue
+          Fn::Sub: '${StackSocle}-Stagiaire'
+
+  RappelRedemarrage:
+    Description: >
+      Inutile de redemarrer les pods : ils relisent les parametres toutes
+      les dix secondes. Patientez une minute et rafraichissez le Service Map.
+    Value: 'Aucune action kubectl necessaire.'

@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  J2 MATIN - Supervision securite.
+  Cree des ressources volontairement non conformes, qui serviront de cible aux
+  regles AWS Config et de contexte aux findings GuardDuty. Le stagiaire active
+  GuardDuty, cree la regle de conformite et analyse les alertes.
+  Duree de deploiement : environ 1 minute.
+
+  ATTENTION FORMATEUR : cette stack cree deliberement des configurations
+  dangereuses (port SSH ouvert au monde, volume non chiffre, role permissif).
+  Elles sont confinees au VPC du lab et doivent etre supprimees en fin de J2.
+
+Parameters:
+
+  StackSocle:
+    Type: String
+    Default: tp-j1-am
+    Description: Nom de la stack socle deployee au J1 matin.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Non-conformite 1 : acces SSH ouvert au monde entier
+  # Cible de la regle Config "restricted-ssh".
+  # ------------------------------------------------------------------
+
+  GroupeSecuriteTropOuvert:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub
+        - 'bss-legacy-admin-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      GroupDescription: >-
+        Groupe de securite herite de migration. Cas reel de regle
+        administration laissee ouverte apres intervention.
+      VpcId: !ImportValue
+        Fn::Sub: '${StackSocle}-IdVpc'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: NON CONFORME - ouverture heritee, cible du TP
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+          Description: NON CONFORME - ouverture heritee, cible du TP
+      Tags:
+        - Key: Name
+          Value: bss-legacy-admin
+        - Key: Conformite
+          Value: NON-CONFORME-VOLONTAIRE
+
+  # ------------------------------------------------------------------
+  # Non-conformite 2 : volume EBS non chiffre
+  # Cible de la regle Config "encrypted-volumes".
+  # ------------------------------------------------------------------
+
+  VolumeNonChiffre:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Delete
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 1
+      VolumeType: gp3
+      Encrypted: false
+      Tags:
+        - Key: Name
+          Value: bss-archive-mediation
+        - Key: Conformite
+          Value: NON-CONFORME-VOLONTAIRE
+
+  # ------------------------------------------------------------------
+  # Non-conformite 3 : bucket sans journalisation ni versionnement
+  # Cible des regles "s3-bucket-logging-enabled" et
+  # "s3-bucket-versioning-enabled".
+  # ------------------------------------------------------------------
+
+  BucketNonConforme:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub
+        - 'bss-exports-facturation-${Suffixe}-${AWS::AccountId}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Conformite
+          Value: NON-CONFORME-VOLONTAIRE
+
+  # ------------------------------------------------------------------
+  # Non-conformite 4 : role applicatif aux droits excessifs
+  #
+  # Le cas le plus frequent en entreprise, et le plus difficile a detecter :
+  # rien ne casse, tout fonctionne, et le jour d'une compromission le rayon
+  # d'action est total.
+  # ------------------------------------------------------------------
+
+  RoleTropPermissif:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'bss-batch-facturation-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Description: >-
+        Role du batch de facturation. Droits volontairement excessifs :
+        cible du TP de gouvernance.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: acces-large-herite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                  - 'sns:*'
+                  - 'sqs:*'
+                Resource: '*'
+      Tags:
+        - Key: Conformite
+          Value: NON-CONFORME-VOLONTAIRE
+
+  # ------------------------------------------------------------------
+  # Role de service pour AWS Config
+  #
+  # Le stagiaire cree le recorder et les regles ; le role de service n'est
+  # pas un objet pedagogique et sa creation manuelle fait perdre du temps.
+  # ------------------------------------------------------------------
+
+  RoleConfig:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'bss-config-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+
+  # ------------------------------------------------------------------
+  # Canal de notification des alertes de securite
+  # ------------------------------------------------------------------
+
+  RubriqueSecurite:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - 'bss-alertes-securite-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      DisplayName: Alertes securite BSS
+
+  PolitiqueRubriqueSecurite:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref RubriqueSecurite
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EventBridgePublie
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref RubriqueSecurite
+
+Outputs:
+
+  RoleConfigArn:
+    Description: >
+      A selectionner lors de la creation du configuration recorder :
+      "Choisir un role existant".
+    Value: !GetAtt RoleConfig.Arn
+
+  RubriqueSecuriteArn:
+    Description: >
+      Cible des regles EventBridge que vous creerez pour router les findings
+      GuardDuty vers une notification.
+    Value: !Ref RubriqueSecurite
+    Export:
+      Name: !Sub '${AWS::StackName}-RubriqueSecurite'
+
+  ResumeNonConformites:
+    Description: Les quatre non-conformites plantees dans l'environnement.
+    Value: !Sub '1) SG ${GroupeSecuriteTropOuvert} ports 22 et 3389 ouverts | 2) Volume ${VolumeNonChiffre} non chiffre | 3) Bucket ${BucketNonConforme} sans versionnement ni journalisation | 4) Role ${RoleTropPermissif} avec s3:* sns:* sqs:* sur toutes ressources'
+
+  ReglesConfigAProposer:
+    Description: Regles managees a deployer pendant le TP.
+    Value: 'restricted-ssh, encrypted-volumes, s3-bucket-versioning-enabled, iam-policy-no-statements-with-admin-access'

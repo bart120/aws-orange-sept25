@@ -62,6 +62,23 @@ else
   exit 1
 fi
 
+# Le portail expose souvent plusieurs roles. Un role en lecture seule laisse
+# passer sts et ec2, puis fait echouer la stack sur iam:GetRole apres plusieurs
+# minutes. On le detecte ici, avant tout deploiement.
+ROLE=$(echo "$IDENT" | cut -d/ -f2)
+vert "Role endosse : $ROLE"
+
+if aws iam list-roles --max-items 1 >/dev/null 2>&1; then
+  vert "Droits IAM : suffisants pour creer les roles des stacks"
+else
+  rouge "Droits IAM insuffisants avec le role $ROLE."
+  echo "        Vous n'etes pas sur le bon role. Retournez au portail d'acces,"
+  echo "        cliquez sur SandboxAdministratorAccess, puis ROUVREZ CloudShell"
+  echo "        depuis ce nouvel onglet — le terminal actuel garde l'ancien role."
+  echo "        Votre dossier ~/lab sera a recloner."
+  exit 1
+fi
+
 titre "2. Stack socle (tp-j1-am)"
 
 ETAT=$(aws cloudformation describe-stacks --stack-name tp-j1-am \

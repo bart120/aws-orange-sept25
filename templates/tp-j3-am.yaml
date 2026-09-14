@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  J3 MATIN - Industrialisation & centralisation.
+  Le portail ne donne qu'un seul compte AWS : la frontiere de compte est donc
+  simulee par trois sources de journaux distinctes (production, preproduction,
+  developpement). Tous les gestes sont reels - flux de souscription, diffusion
+  vers S3, tableau de bord global - seule la separation de comptes est jouee.
+  A annoncer explicitement aux stagiaires.
+  Duree de deploiement : environ 3 minutes.
+
+Parameters:
+
+  StackSocle:
+    Type: String
+    Default: tp-j1-am
+    Description: Nom de la stack socle deployee au J1 matin.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Les trois "comptes" simules
+  #
+  # Dans une vraie organisation, ces trois log groups vivraient dans trois
+  # comptes membres distincts. Ici ils cohabitent, mais la mecanique de
+  # centralisation que le stagiaire va construire est rigoureusement la meme.
+  # ------------------------------------------------------------------
+
+  JournalProduction:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub
+        - '/orange/${Suffixe}/compte-production/bss'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      RetentionInDays: 3
+
+  JournalPreproduction:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub
+        - '/orange/${Suffixe}/compte-preproduction/bss'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      RetentionInDays: 3
+
+  JournalDeveloppement:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub
+        - '/orange/${Suffixe}/compte-developpement/bss'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      RetentionInDays: 3
+
+  # ------------------------------------------------------------------
+  # Destination de centralisation
+  # ------------------------------------------------------------------
+
+  BucketSoc:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub
+        - 'bss-soc-central-${Suffixe}-${AWS::AccountId}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: purge-fin-de-formation
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # ------------------------------------------------------------------
+  # Flux de diffusion vers le bucket SOC
+  #
+  # C'est la brique que le stagiaire ne doit pas construire : la creation
+  # d'un flux Firehose et de ses roles est de la plomberie. Ce qu'il cree,
+  # lui, ce sont les filtres de souscription qui alimentent ce flux.
+  # ------------------------------------------------------------------
+
+  RoleDiffusion:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'bss-firehose-soc-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecriture-bucket-soc
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt BucketSoc.Arn
+                  - !Sub '${BucketSoc.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  FluxSoc:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub
+        - 'bss-soc-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt BucketSoc.Arn
+        RoleARN: !GetAtt RoleDiffusion.Arn
+        Prefix: 'journaux-centralises/'
+        ErrorOutputPrefix: 'erreurs/'
+        CompressionFormat: GZIP
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+
+  # ------------------------------------------------------------------
+  # Role que CloudWatch Logs endosse pour ecrire dans le flux
+  #
+  # Il est fourni parce que sa politique de confiance est contre-intuitive
+  # et fait perdre un quart d'heure a tout le monde la premiere fois.
+  # ------------------------------------------------------------------
+
+  RoleSouscription:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'bss-logs-vers-firehose-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecriture-flux
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FluxSoc.Arn
+
+  # ------------------------------------------------------------------
+  # Identite du generateur de journaux
+  #
+  # Un CronJob Kubernetes (manifeste bss-comptes-simules.yaml) alimente les
+  # trois log groups pour qu'ils ne soient pas vides au demarrage du TP.
+  # ------------------------------------------------------------------
+
+  RoleGenerateur:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'bss-generateur-journaux-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: ecriture-journaux-simules
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub
+                  - 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/orange/${Suffixe}/*'
+                  - Suffixe: !ImportValue
+                      Fn::Sub: '${StackSocle}-Stagiaire'
+
+  AssociationGenerateur:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !ImportValue
+        Fn::Sub: '${StackSocle}-NomCluster'
+      Namespace: bss
+      ServiceAccount: bss-generateur
+      RoleArn: !GetAtt RoleGenerateur.Arn
+
+Outputs:
+
+  TroisComptesSimules:
+    Description: Les trois sources a centraliser pendant le TP.
+    Value: !Sub
+      - '/orange/${Suffixe}/compte-production/bss, /orange/${Suffixe}/compte-preproduction/bss, /orange/${Suffixe}/compte-developpement/bss'
+      - Suffixe: !ImportValue
+          Fn::Sub: '${StackSocle}-Stagiaire'
+
+  NomFluxSoc:
+    Description: Destination a selectionner lors de la creation des filtres de souscription.
+    Value: !Ref FluxSoc
+
+  RoleSouscriptionArn:
+    Description: >
+      Role a indiquer lors de la creation d'un filtre de souscription
+      CloudWatch Logs vers Firehose.
+    Value: !GetAtt RoleSouscription.Arn
+
+  BucketSoc:
+    Description: Bucket de centralisation. Les objets apparaissent apres 60 secondes de mise en tampon.
+    Value: !Ref BucketSoc
+
+  LimiteAAnnoncer:
+    Description: Phrase a dire aux stagiaires au demarrage du TP.
+    Value: >
+      Les trois sources representent trois comptes AWS. Dans une vraie
+      organisation, les filtres de souscription seraient identiques mais le
+      flux Firehose vivrait dans un compte SOC dedie, avec une politique de
+      ressource autorisant les comptes membres a y ecrire.

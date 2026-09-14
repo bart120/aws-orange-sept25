@@ -31,6 +31,7 @@ Les fichiers arrivent au fil de la formation. Sans cette commande, le fichier de
 | `fascicules/` | Un fascicule par demi-journée |
 | `templates/` | Les modèles CloudFormation qui construisent votre environnement |
 | `manifests/` | Les manifestes Kubernetes de la chaîne applicative (à partir du J1 après-midi) |
+| `controle-acces.sh` | Contrôle d'entrée — à lancer **avant** le premier déploiement |
 | `verifier.sh` | Diagnostic de votre environnement — `bash ~/lab/verifier.sh $INIT` |
 
 ---

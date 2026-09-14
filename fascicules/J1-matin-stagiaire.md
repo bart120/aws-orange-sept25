@@ -15,9 +15,12 @@ Ouvrez **CloudShell** (icône `>_` en bas à gauche de la console), puis :
 git clone https://github.com/bart120/aws-orange-sept25.git ~/lab
 cd ~/lab
 
-export INIT=<vos-initiales>
+INIT=<vos-initiales>            # tapez-les comme vous voulez
+export INIT=${INIT,,}           # forcees en minuscules : S3 n'accepte que ca
 export REG=${AWS_REGION:-$(aws configure get region)}
 echo "$INIT dans $REG"          # relisez cette ligne
+
+bash controle-acces.sh          # quinze secondes, ne sautez pas cette ligne
 
 aws cloudformation deploy \
   --template-file templates/tp-j1-am.yaml \
@@ -25,6 +28,8 @@ aws cloudformation deploy \
   --parameter-overrides Stagiaire=$INIT \
   --capabilities CAPABILITY_NAMED_IAM
 ```
+
+> **Si `controle-acces.sh` affiche un rouge, ne déployez pas.** Le portail propose plusieurs rôles et un rôle en lecture seule laisse tout passer jusqu'à faire échouer la stack au bout de plusieurs minutes, sur un message qui ne dit pas la cause. Le script vous indique quoi faire.
 
 Laissez tourner. Le détail des commandes, le calendrier des trois jours et les messages d'erreur courants sont dans **`FICHE-DEPLOIEMENT.md`**, à garder ouvert.
 

@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  J3 APRES-MIDI - FinOps & atelier final.
+  Cette stack ne cree presque rien, et c'est voulu : l'incident se declenche
+  en modifiant a la main les quatre parametres crees au J2 apres-midi, ce qui
+  laisse au formateur le controle du moment. Les couts observes dans Cost
+  Explorer sont reels et accumules depuis le J1 - il n'y a rien a simuler.
+  Duree de deploiement : environ 1 minute.
+
+Parameters:
+
+  StackSocle:
+    Type: String
+    Default: tp-j1-am
+    Description: Nom de la stack socle deployee au J1 matin.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Canal de notification de l'atelier
+  #
+  # Les stagiaires y brancheront les alarmes qu'ils jugeront pertinentes.
+  # Le choix des alarmes fait partie de l'evaluation : c'est la question
+  # de cloture de la formation.
+  # ------------------------------------------------------------------
+
+  RubriqueIncident:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - 'bss-incident-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      DisplayName: Incident BSS - atelier final
+
+  # ------------------------------------------------------------------
+  # Note pedagogique FinOps
+  #
+  # Les cles de repartition des couts ne s'activent que dans le compte
+  # payeur, ce que la sandbox n'est pas. Le groupement se fera donc par
+  # service dans Cost Explorer. C'est une limite reelle des comptes
+  # membres, pas un defaut du lab : a expliquer plutot qu'a masquer.
+  # ------------------------------------------------------------------
+
+  NoteEtiquetage:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/finops/note-etiquetage'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: >
+        Les cles de repartition des couts s'activent dans le compte payeur.
+        Depuis un compte membre, groupez par service dans Cost Explorer.
+      Description: Note pedagogique FinOps.
+
+Outputs:
+
+  RubriqueIncidentArn:
+    Description: Cible des alarmes que les stagiaires creeront pendant l'atelier.
+    Value: !Ref RubriqueIncident
+
+  DeclencherIncident:
+    Description: >
+      A executer dans CloudShell devant le groupe pour basculer la chaine en
+      mode degrade. Effet visible en moins d'une minute.
+    Value: !Sub
+      - 'I=${Suffixe}; aws ssm put-parameter --overwrite --name /bss/$I/provisioning/charge-cpu --value 85 --type String; aws ssm put-parameter --overwrite --name /bss/$I/facturation/taux-erreur --value 35 --type String; aws ssm put-parameter --overwrite --name /bss/$I/mediation/latence-ms --value 4500 --type String; aws ssm put-parameter --overwrite --name /bss/$I/idm/auth-anormale --value true --type String'
+      - Suffixe: !ImportValue
+          Fn::Sub: '${StackSocle}-Stagiaire'
+
+  ArreterIncident:
+    Description: Retour au regime nominal, si vous voulez rejouer la sequence.
+    Value: !Sub
+      - 'I=${Suffixe}; aws ssm put-parameter --overwrite --name /bss/$I/provisioning/charge-cpu --value 0 --type String; aws ssm put-parameter --overwrite --name /bss/$I/facturation/taux-erreur --value 0 --type String; aws ssm put-parameter --overwrite --name /bss/$I/mediation/latence-ms --value 0 --type String; aws ssm put-parameter --overwrite --name /bss/$I/idm/auth-anormale --value false --type String'
+      - Suffixe: !ImportValue
+          Fn::Sub: '${StackSocle}-Stagiaire'
+
+  LesCinqSymptomes:
+    Description: Ce que les stagiaires doivent constater, et ou.
+    Value: >
+      1) CPU eleve : Container Insights, pods provisioning.
+      2) Erreurs 500 : Logs Insights sur le log group application.
+      3) Latence API : Service Map X-Ray, noeud mediation.
+      4) Activite suspecte : logs de l IDM, authentifications refusees en rafale.
+      5) Couts en hausse : Cost Explorer, granularite journaliere, groupe par service.
+
+  OuChercherLesCouts:
+    Description: Parcours Cost Explorer de l'atelier.
+    Value: >
+      Cost Explorer, granularite journaliere, groupement par service, sur les
+      trois derniers jours. Le poste EKS domine et croit depuis le J1 :
+      la courbe est reelle, pas simulee.
+
+  QuestionDeCloture:
+    Description: Question a poser au groupe en fin d'atelier.
+    Value: >
+      Parmi les alarmes que vous venez de creer, lesquelles auriez-vous
+      reellement voulu recevoir a trois heures du matin ?

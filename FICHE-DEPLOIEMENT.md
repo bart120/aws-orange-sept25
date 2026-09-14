@@ -10,7 +10,7 @@ Notez-les ici, vous les retaperez souvent.
 
 | | |
 |---|---|
-| **Vos initiales** | `……………` (2 à 8 caractères, minuscules et chiffres) |
+| **Vos initiales** | `……………` (2 à 8 caractères, **minuscules** et chiffres, rien d'autre) |
 | **Votre région** | `……………………` (en haut à droite de la console) |
 
 > Toutes vos ressources portent vos initiales et vivent dans **votre** région. Si vous ne retrouvez pas quelque chose, vérifiez la région avant toute autre hypothèse.
@@ -37,12 +37,23 @@ cd ~/lab
 **4. Poser vos deux constantes** — à refaire à chaque ouverture de CloudShell
 
 ```bash
-export INIT=<vos-initiales>
+INIT=<vos-initiales>            # tapez-les comme vous voulez
+export INIT=${INIT,,}           # forcees en minuscules
 export REG=${AWS_REGION:-$(aws configure get region)}
 echo "$INIT dans $REG"
 ```
 
 Toutes les commandes de cette fiche s'appuient dessus. Relisez la ligne affichée : c'est votre identité de travail pour trois jours.
+
+**5. Contrôler votre accès** — quinze secondes, avant tout déploiement
+
+```bash
+bash ~/lab/controle-acces.sh
+```
+
+> **Ne sautez pas cette ligne.** Le portail expose plusieurs rôles. Un rôle en lecture seule laisse passer la connexion, laisse passer CloudShell, laisse même démarrer le déploiement — puis fait échouer la stack au bout de plusieurs minutes sur `not authorized to perform: iam:GetRole`. Le script le détecte en quinze secondes et vous dit quoi faire.
+
+> **Pourquoi la deuxième ligne.** Vos initiales suffixent des noms de compartiments S3, qui n'acceptent **ni majuscule, ni accent, ni tiret**. `${INIT,,}` les met en minuscules pour vous. Sans elle, `Stagiaire=VL` fait échouer la stack avant même de créer quoi que ce soit, sur `failed to satisfy constraint`.
 
 ---
 

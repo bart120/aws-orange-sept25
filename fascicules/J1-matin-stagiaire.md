@@ -16,11 +16,8 @@ git clone https://github.com/bart120/aws-orange-sept25.git ~/lab
 cd ~/lab
 
 INIT=<vos-initiales>            # tapez-les comme vous voulez
-export INIT=${INIT,,}           # forcees en minuscules : S3 n'accepte que ca
 export REG=${AWS_REGION:-$(aws configure get region)}
 echo "$INIT dans $REG"          # relisez cette ligne
-
-bash controle-acces.sh          # quinze secondes, ne sautez pas cette ligne
 
 aws cloudformation deploy \
   --template-file templates/tp-j1-am.yaml \
@@ -29,11 +26,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-> **Si `controle-acces.sh` affiche un rouge, ne déployez pas.** Le portail propose plusieurs rôles et un rôle en lecture seule laisse tout passer jusqu'à faire échouer la stack au bout de plusieurs minutes, sur un message qui ne dit pas la cause. Le script vous indique quoi faire.
 
 Laissez tourner. Le détail des commandes, le calendrier des trois jours et les messages d'erreur courants sont dans **`FICHE-DEPLOIEMENT.md`**, à garder ouvert.
-
-Le TP du matin, lui, se fait **entièrement dans la console** et ne dépend pas de cette stack. Vous pouvez enchaîner sans attendre.
 
 ---
 
@@ -49,8 +43,6 @@ Répondre à cette question suppose trois choses en place **avant** l'incident :
 
 C'est précisément ce que vous allez construire ce matin, sur un nœud isolé représentant un collecteur de médiation. L'objectif n'est pas de savoir cliquer dans CloudWatch : c'est de comprendre **pourquoi** un seuil à 70 % pendant 5 minutes n'a pas le même sens qu'un seuil à 90 % pendant 1 minute, et ce que chacun coûte en réveils nocturnes inutiles.
 
-À la fin de la matinée, vous saurez répondre à : *sur quelle métrique, à quel seuil, pendant combien de temps, et qui je préviens ?*
-
 ---
 
 ## 2. Services mobilisés et prérequis
@@ -63,15 +55,12 @@ C'est précisément ce que vous allez construire ce matin, sur un nœud isolé r
 | Accès à l'instance | EC2 Instance Connect, dans le navigateur — **aucune clé SSH à gérer** |
 | Adresse e-mail | La vôtre, professionnelle. Vous recevrez une demande de confirmation AWS à valider. |
 
-**Point d'attention préalable :** votre compte sandbox peut ne pas disposer de VPC par défaut. L'étape 0 le vérifie et le crée si besoin. Ne sautez pas cette étape, sinon le lancement de l'instance échouera sans message explicite.
-
 ---
 
-## 3. Durée et coût
+## 3. Coût
 
 | | |
 |---|---|
-| Durée estimée | 2 h 15 (hors pause) |
 | Coût des ressources créées | **Moins de 0,05 €** si le nettoyage de la section 6 est effectué |
 | Poste principal | Instance `t3.micro` — facturée à la seconde |
 | Alarmes CloudWatch | 10 alarmes gratuites par compte et par mois |
@@ -201,6 +190,5 @@ Dans cet ordre :
 2. **CloudWatch → Tableaux de bord** : conserver le vôtre, il servira au J3.
 3. **EC2 → Instances** : sélectionner votre instance → *État de l'instance* → **Résilier**.
 4. **EC2 → Groupes de sécurité** : supprimer `sg-mediation-<initiales>` une fois l'instance résiliée.
-5. **SNS** : conserver la rubrique et l'abonnement, ils resserviront cet après-midi.
+5. **SNS** : conserver la rubrique et l'abonnement.
 
-> Une instance oubliée coûte environ 0,25 € par jour. Ce n'est rien, jusqu'au moment où vingt stagiaires l'oublient pendant trois semaines. Le J3 après-midi sera consacré exactement à cette question.

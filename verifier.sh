@@ -113,8 +113,12 @@ fi
 titre "4. Chaine BSS"
 
 if kubectl get namespace bss >/dev/null 2>&1; then
-  TOTAL=$(kubectl get pods -n bss --no-headers 2>/dev/null | wc -l)
-  PRETS=$(kubectl get pods -n bss --no-headers 2>/dev/null | grep -c "Running")
+  # Les pods du CronJob des comptes simules passent en Completed une fois leur
+  # travail fait. Ce ne sont pas des services permanents : les compter comme
+  # "pas prets" ferait passer en rouge un environnement parfaitement sain.
+  LISTE=$(kubectl get pods -n bss --no-headers 2>/dev/null | grep -vE "Completed|Succeeded")
+  TOTAL=$(printf '%s\n' "$LISTE" | grep -c .)
+  PRETS=$(printf '%s\n' "$LISTE" | grep -c "Running")
   if [ "$TOTAL" -gt 0 ] && [ "$PRETS" -eq "$TOTAL" ]; then
     vert "Pods : $PRETS/$TOTAL en cours d'execution"
     DERNIER=$(kubectl logs -n bss deploy/generateur-commandes --tail=1 2>/dev/null)
@@ -125,7 +129,7 @@ if kubectl get namespace bss >/dev/null 2>&1; then
     fi
   elif [ "$TOTAL" -gt 0 ]; then
     gris "Pods : $PRETS/$TOTAL prets — l'installation des dependances prend 60 a 90 secondes."
-    kubectl get pods -n bss --no-headers 2>/dev/null | grep -v Running | awk '{print "        "$1" : "$3}'
+    printf '%s\n' "$LISTE" | grep -v Running | awk 'NF {print "        "$1" : "$3}'
   fi
 else
   gris "Chaine BSS non deployee — normal avant le J1 apres-midi."

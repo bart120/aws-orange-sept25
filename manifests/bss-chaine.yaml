@@ -1,0 +1,540 @@
+# ---------------------------------------------------------------------------
+# Chaine BSS simulee - CRM, Provisioning, Mediation, Facturation, IDM
+#
+# Aucune image a construire : on part d'une image Python publique et le code
+# des cinq services est injecte par ConfigMap. Les stagiaires peuvent donc
+# lire le code instrumente directement dans le manifeste.
+#
+# Avant d'appliquer :
+#   aws eks update-kubeconfig --region <votre-region> --name bss-<vos-initiales>
+#   sed -i 's/REMPLACER_INITIALES/<vos-initiales>/g; s/REMPLACER_REGION/<votre-region>/g' bss-chaine.yaml
+#   kubectl apply -f bss-chaine.yaml
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bss
+  labels:
+    formation: supervision-aws
+---
+# Le compte de service associe au role IAM par EKS Pod Identity
+# (association creee par la stack tp-j2-pm).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bss-chaine
+  namespace: bss
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bss-code
+  namespace: bss
+data:
+  app.py: |
+    """Chaine BSS simulee. Un seul fichier, cinq roles distincts.
+
+    Le role est donne par la variable d'environnement ROLE. Chaque role a un
+    comportement reellement different : c'est ce qui rend le Service Map
+    lisible et l'analyse d'incident credible.
+    """
+    import json
+    import logging
+    import os
+    import random
+    import sys
+    import time
+
+    import boto3
+    from aws_xray_sdk.core import patch_all, xray_recorder
+    from aws_xray_sdk.ext.flask.middleware import XRayMiddleware
+    from flask import Flask, jsonify, request
+
+    ROLE = os.environ.get("ROLE", "inconnu")
+    SUIVANT = os.environ.get("SUIVANT", "")
+    INITIALES = os.environ.get("INITIALES", "xx")
+    REGION = os.environ.get("AWS_REGION", "REMPLACER_REGION")
+
+    # --- Journalisation structuree -----------------------------------------
+    # Fluent Bit, installe par l'add-on CloudWatch Observability, recupere
+    # stdout tel quel. Ecrire du JSON ici, c'est rendre les logs requetables
+    # par Logs Insights sans aucune transformation.
+
+    logger = logging.getLogger(ROLE)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+    def journaliser(**champs):
+        champs.setdefault("service", ROLE)
+        champs.setdefault("horodatage", time.time())
+        logger.info(json.dumps(champs))
+
+
+    # --- Parametres de pilotage --------------------------------------------
+    # Relus toutes les dix secondes : le formateur peut declencher un
+    # incident en modifiant un parametre, sans redeployer quoi que ce soit.
+
+    ssm = boto3.client("ssm", region_name=REGION)
+    _cache = {"expire": 0.0, "valeurs": {}}
+
+
+    def parametres():
+        if time.time() < _cache["expire"]:
+            return _cache["valeurs"]
+        valeurs = {}
+        try:
+            reponse = ssm.get_parameters_by_path(
+                Path=f"/bss/{INITIALES}/", Recursive=True
+            )
+            for p in reponse.get("Parameters", []):
+                valeurs[p["Name"].split("/", 3)[-1]] = p["Value"]
+        except Exception as exc:  # la chaine doit survivre a une panne SSM
+            journaliser(niveau="WARN", message="lecture SSM impossible", erreur=str(exc))
+        _cache["valeurs"] = valeurs
+        _cache["expire"] = time.time() + 10
+        return valeurs
+
+
+    def parametre(cle, defaut):
+        brut = parametres().get(cle)
+        if brut is None:
+            return defaut
+        try:
+            return type(defaut)(brut)
+        except (TypeError, ValueError):
+            return defaut
+
+
+    # --- Tracage distribue --------------------------------------------------
+    # Le demon X-Ray tourne en DaemonSet (manifeste xray-daemonset.yaml) et
+    # ecoute sur le port UDP 2000 de chaque noeud.
+
+    xray_recorder.configure(
+        service=f"bss-{ROLE}",
+        daemon_address=os.environ.get("AWS_XRAY_DAEMON_ADDRESS", "127.0.0.1:2000"),
+        context_missing="LOG_ERROR",
+    )
+    patch_all()
+
+    app = Flask(__name__)
+    XRayMiddleware(app, xray_recorder)
+
+    import requests  # apres patch_all pour que les appels sortants soient traces
+
+
+    def appeler_suivant(charge):
+        if not SUIVANT:
+            return {"statut": "fin-de-chaine"}
+        reponse = requests.post(f"http://{SUIVANT}/traiter", json=charge, timeout=15)
+        return reponse.json()
+
+
+    # --- Comportements par role ---------------------------------------------
+
+    def role_crm(charge):
+        """Point d'entree. Valide la commande puis la transmet."""
+        if not charge.get("client"):
+            journaliser(niveau="ERROR", statut=400, message="client absent")
+            return {"statut": 400, "erreur": "client absent"}, 400
+        journaliser(niveau="INFO", statut=200, etape="commande-acceptee",
+                    commande=charge.get("commande"))
+        return appeler_suivant(charge)
+
+
+    def role_provisioning(charge):
+        """Active la ligne. Consomme du CPU en proportion du parametre."""
+        intensite = parametre("provisioning/charge-cpu", 0)
+        if intensite > 0:
+            fin = time.time() + (intensite / 100.0) * 0.4
+            while time.time() < fin:
+                sum(i * i for i in range(5000))
+        journaliser(niveau="INFO", statut=200, etape="ligne-activee",
+                    charge_cpu=intensite)
+        return appeler_suivant(charge)
+
+
+    def role_mediation(charge):
+        """Collecte les tickets. C'est ici qu'on injecte la latence."""
+        latence = parametre("mediation/latence-ms", 0)
+        if latence > 0:
+            time.sleep(latence / 1000.0)
+        # Depot du ticket dans la file asynchrone vers la facturation.
+        try:
+            sqs = boto3.client("sqs", region_name=REGION)
+            url = sqs.get_queue_url(QueueName=f"bss-facturation-{INITIALES}")["QueueUrl"]
+            sqs.send_message(QueueUrl=url, MessageBody=json.dumps(charge))
+            journaliser(niveau="INFO", statut=200, etape="ticket-depose",
+                        latence_ms=latence)
+        except Exception as exc:
+            journaliser(niveau="ERROR", statut=500, etape="depot-ticket-echoue",
+                        erreur=str(exc))
+        return appeler_suivant(charge)
+
+
+    def role_facturation(charge):
+        """Valorise le ticket. Echoue selon le taux configure."""
+        taux = parametre("facturation/taux-erreur", 0)
+        if random.randint(1, 100) <= taux:
+            journaliser(niveau="ERROR", statut=500, etape="valorisation-echouee",
+                        motif="tarif introuvable pour l offre")
+            return {"statut": 500, "erreur": "valorisation echouee"}, 500
+        journaliser(niveau="INFO", statut=200, etape="facture-emise",
+                    montant=round(random.uniform(9.9, 79.9), 2))
+        return appeler_suivant(charge)
+
+
+    def role_idm(charge):
+        """Authentifie l'appelant. Genere des rafales anormales si demande."""
+        anormal = parametre("idm/auth-anormale", "false") == "true"
+        if anormal and random.random() < 0.4:
+            journaliser(
+                niveau="WARN", statut=401, etape="authentification-refusee",
+                utilisateur=random.choice(["svc_export", "admin_bss", "root_oag"]),
+                adresse_source=f"185.220.{random.randint(1, 254)}.{random.randint(1, 254)}",
+                motif="mot de passe invalide",
+            )
+            return {"statut": 401, "erreur": "authentification refusee"}, 401
+        journaliser(niveau="INFO", statut=200, etape="authentification-reussie")
+        return appeler_suivant(charge)
+
+
+    COMPORTEMENTS = {
+        "crm": role_crm,
+        "provisioning": role_provisioning,
+        "mediation": role_mediation,
+        "facturation": role_facturation,
+        "idm": role_idm,
+    }
+
+
+    @app.route("/traiter", methods=["POST"])
+    def traiter():
+        debut = time.time()
+        charge = request.get_json(silent=True) or {}
+        resultat = COMPORTEMENTS.get(ROLE, lambda c: {"statut": "role-inconnu"})(charge)
+        corps, code = resultat if isinstance(resultat, tuple) else (resultat, 200)
+        journaliser(niveau="INFO", statut=code, etape="requete-terminee",
+                    duree_ms=round((time.time() - debut) * 1000, 1))
+        return jsonify(corps), code
+
+
+    @app.route("/sante")
+    def sante():
+        return jsonify({"service": ROLE, "etat": "ok"})
+
+
+    if __name__ == "__main__":
+        journaliser(niveau="INFO", etape="demarrage", suivant=SUIVANT or "aucun")
+        app.run(host="0.0.0.0", port=8080, threaded=True)
+
+  demarrage.sh: |
+    #!/bin/sh
+    set -e
+    pip install --quiet --no-cache-dir \
+        flask requests boto3 aws-xray-sdk
+    exec python /code/app.py
+---
+# ---------------------------------------------------------------------------
+# Les cinq services. L'ordre des appels dessine la chaine :
+#   crm -> idm -> provisioning -> mediation -> (SQS) -> facturation
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: List
+items:
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: crm
+    namespace: bss
+    labels: {app: crm, chaine: bss}
+  spec:
+    replicas: 1
+    selector: {matchLabels: {app: crm}}
+    template:
+      metadata:
+        labels: {app: crm, chaine: bss}
+      spec:
+        serviceAccountName: bss-chaine
+        containers:
+        - name: crm
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "/code/demarrage.sh"]
+          env:
+          - {name: ROLE, value: "crm"}
+          - {name: SUIVANT, value: "idm.bss.svc.cluster.local:8080"}
+          - {name: INITIALES, value: "REMPLACER_INITIALES"}
+          - {name: AWS_REGION, value: "REMPLACER_REGION"}
+          # status.hostIP ne donne que l'IP : le port est ajoute par une
+          # variable dependante, syntaxe $(VAR) supportee par Kubernetes.
+          - name: HOTE_XRAY
+            valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          - {name: AWS_XRAY_DAEMON_ADDRESS, value: "$(HOTE_XRAY):2000"}
+          ports: [{containerPort: 8080}]
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+          volumeMounts: [{name: code, mountPath: /code}]
+          readinessProbe:
+            httpGet: {path: /sante, port: 8080}
+            initialDelaySeconds: 45
+            periodSeconds: 10
+        volumes:
+        - name: code
+          configMap: {name: bss-code}
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: idm
+    namespace: bss
+    labels: {app: idm, chaine: bss}
+  spec:
+    replicas: 1
+    selector: {matchLabels: {app: idm}}
+    template:
+      metadata:
+        labels: {app: idm, chaine: bss}
+      spec:
+        serviceAccountName: bss-chaine
+        containers:
+        - name: idm
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "/code/demarrage.sh"]
+          env:
+          - {name: ROLE, value: "idm"}
+          - {name: SUIVANT, value: "provisioning.bss.svc.cluster.local:8080"}
+          - {name: INITIALES, value: "REMPLACER_INITIALES"}
+          - {name: AWS_REGION, value: "REMPLACER_REGION"}
+          # status.hostIP ne donne que l'IP : le port est ajoute par une
+          # variable dependante, syntaxe $(VAR) supportee par Kubernetes.
+          - name: HOTE_XRAY
+            valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          - {name: AWS_XRAY_DAEMON_ADDRESS, value: "$(HOTE_XRAY):2000"}
+          ports: [{containerPort: 8080}]
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+          volumeMounts: [{name: code, mountPath: /code}]
+          readinessProbe:
+            httpGet: {path: /sante, port: 8080}
+            initialDelaySeconds: 45
+            periodSeconds: 10
+        volumes:
+        - name: code
+          configMap: {name: bss-code}
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: provisioning
+    namespace: bss
+    labels: {app: provisioning, chaine: bss}
+  spec:
+    replicas: 2          # deux repliques : repartition multi-AZ observable
+    selector: {matchLabels: {app: provisioning}}
+    template:
+      metadata:
+        labels: {app: provisioning, chaine: bss}
+      spec:
+        serviceAccountName: bss-chaine
+        topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: provisioning}}
+        containers:
+        - name: provisioning
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "/code/demarrage.sh"]
+          env:
+          - {name: ROLE, value: "provisioning"}
+          - {name: SUIVANT, value: "mediation.bss.svc.cluster.local:8080"}
+          - {name: INITIALES, value: "REMPLACER_INITIALES"}
+          - {name: AWS_REGION, value: "REMPLACER_REGION"}
+          # status.hostIP ne donne que l'IP : le port est ajoute par une
+          # variable dependante, syntaxe $(VAR) supportee par Kubernetes.
+          - name: HOTE_XRAY
+            valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          - {name: AWS_XRAY_DAEMON_ADDRESS, value: "$(HOTE_XRAY):2000"}
+          ports: [{containerPort: 8080}]
+          resources:
+            requests: {cpu: "200m", memory: "128Mi"}
+            limits: {cpu: "800m", memory: "256Mi"}
+          volumeMounts: [{name: code, mountPath: /code}]
+          readinessProbe:
+            httpGet: {path: /sante, port: 8080}
+            initialDelaySeconds: 45
+            periodSeconds: 10
+        volumes:
+        - name: code
+          configMap: {name: bss-code}
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: mediation
+    namespace: bss
+    labels: {app: mediation, chaine: bss}
+  spec:
+    replicas: 1
+    selector: {matchLabels: {app: mediation}}
+    template:
+      metadata:
+        labels: {app: mediation, chaine: bss}
+      spec:
+        serviceAccountName: bss-chaine
+        containers:
+        - name: mediation
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "/code/demarrage.sh"]
+          env:
+          - {name: ROLE, value: "mediation"}
+          - {name: SUIVANT, value: "facturation.bss.svc.cluster.local:8080"}
+          - {name: INITIALES, value: "REMPLACER_INITIALES"}
+          - {name: AWS_REGION, value: "REMPLACER_REGION"}
+          # status.hostIP ne donne que l'IP : le port est ajoute par une
+          # variable dependante, syntaxe $(VAR) supportee par Kubernetes.
+          - name: HOTE_XRAY
+            valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          - {name: AWS_XRAY_DAEMON_ADDRESS, value: "$(HOTE_XRAY):2000"}
+          ports: [{containerPort: 8080}]
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+          volumeMounts: [{name: code, mountPath: /code}]
+          readinessProbe:
+            httpGet: {path: /sante, port: 8080}
+            initialDelaySeconds: 45
+            periodSeconds: 10
+        volumes:
+        - name: code
+          configMap: {name: bss-code}
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: facturation
+    namespace: bss
+    labels: {app: facturation, chaine: bss}
+  spec:
+    replicas: 1
+    selector: {matchLabels: {app: facturation}}
+    template:
+      metadata:
+        labels: {app: facturation, chaine: bss}
+      spec:
+        serviceAccountName: bss-chaine
+        containers:
+        - name: facturation
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "/code/demarrage.sh"]
+          env:
+          - {name: ROLE, value: "facturation"}
+          - {name: SUIVANT, value: ""}
+          - {name: INITIALES, value: "REMPLACER_INITIALES"}
+          - {name: AWS_REGION, value: "REMPLACER_REGION"}
+          # status.hostIP ne donne que l'IP : le port est ajoute par une
+          # variable dependante, syntaxe $(VAR) supportee par Kubernetes.
+          - name: HOTE_XRAY
+            valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          - {name: AWS_XRAY_DAEMON_ADDRESS, value: "$(HOTE_XRAY):2000"}
+          ports: [{containerPort: 8080}]
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+          volumeMounts: [{name: code, mountPath: /code}]
+          readinessProbe:
+            httpGet: {path: /sante, port: 8080}
+            initialDelaySeconds: 45
+            periodSeconds: 10
+        volumes:
+        - name: code
+          configMap: {name: bss-code}
+
+- apiVersion: v1
+  kind: Service
+  metadata: {name: crm, namespace: bss}
+  spec:
+    selector: {app: crm}
+    ports: [{port: 8080, targetPort: 8080}]
+
+- apiVersion: v1
+  kind: Service
+  metadata: {name: idm, namespace: bss}
+  spec:
+    selector: {app: idm}
+    ports: [{port: 8080, targetPort: 8080}]
+
+- apiVersion: v1
+  kind: Service
+  metadata: {name: provisioning, namespace: bss}
+  spec:
+    selector: {app: provisioning}
+    ports: [{port: 8080, targetPort: 8080}]
+
+- apiVersion: v1
+  kind: Service
+  metadata: {name: mediation, namespace: bss}
+  spec:
+    selector: {app: mediation}
+    ports: [{port: 8080, targetPort: 8080}]
+
+- apiVersion: v1
+  kind: Service
+  metadata: {name: facturation, namespace: bss}
+  spec:
+    selector: {app: facturation}
+    ports: [{port: 8080, targetPort: 8080}]
+
+# ---------------------------------------------------------------------------
+# Generateur de commandes
+# Sans trafic, pas de metriques, pas de logs, pas de traces. Ce pod maintient
+# un flux continu de commandes clientes pendant les trois jours.
+# ---------------------------------------------------------------------------
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: generateur-commandes
+    namespace: bss
+    labels: {app: generateur-commandes, chaine: bss}
+  spec:
+    replicas: 1
+    selector: {matchLabels: {app: generateur-commandes}}
+    template:
+      metadata:
+        labels: {app: generateur-commandes, chaine: bss}
+      spec:
+        containers:
+        - name: generateur
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command:
+          - /bin/sh
+          - -c
+          - |
+            pip install --quiet --no-cache-dir requests
+            python - <<'PY'
+            import json, random, time, requests
+            cible = "http://crm.bss.svc.cluster.local:8080/traiter"
+            offres = ["fibre-1G", "mobile-5G", "box-tv", "pro-vpn"]
+            while True:
+                charge = {"client": f"CLI{random.randint(10000, 99999)}",
+                          "commande": f"CMD{random.randint(100000, 999999)}",
+                          "offre": random.choice(offres)}
+                try:
+                    r = requests.post(cible, json=charge, timeout=20)
+                    print(json.dumps({"service": "generateur",
+                                      "statut": r.status_code,
+                                      "commande": charge["commande"]}), flush=True)
+                except Exception as exc:
+                    print(json.dumps({"service": "generateur", "statut": 599,
+                                      "erreur": str(exc)}), flush=True)
+                time.sleep(random.uniform(1.5, 4.0))
+            PY
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "200m", memory: "128Mi"}

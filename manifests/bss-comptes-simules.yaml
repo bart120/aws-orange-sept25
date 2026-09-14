@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Generateur de journaux "multi-comptes" - J3 matin
+#
+# Alimente les trois log groups /orange/<initiales>/compte-*/bss pour que le
+# TP de centralisation ait de la matiere des la premiere minute. Dans une
+# vraie organisation, ces trois flux viendraient de trois comptes membres
+# distincts ; ici ils sont produits localement, mais les filtres de
+# souscription que le stagiaire construira sont identiques.
+#
+# Avant d'appliquer :
+#   sed -i 's/REMPLACER_INITIALES/<vos-initiales>/g; s/REMPLACER_REGION/<votre-region>/g' bss-comptes-simules.yaml
+#   kubectl apply -f bss-comptes-simules.yaml
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bss-generateur
+  namespace: bss
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: journaux-multi-comptes
+  namespace: bss
+spec:
+  schedule: "*/2 * * * *"          # toutes les deux minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 120
+      template:
+        spec:
+          serviceAccountName: bss-generateur
+          restartPolicy: Never
+          containers:
+          - name: generateur
+            image: public.ecr.aws/docker/library/python:3.12-slim
+            env:
+            - {name: INITIALES, value: "REMPLACER_INITIALES"}
+            - {name: AWS_REGION, value: "REMPLACER_REGION"}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --quiet --no-cache-dir boto3
+              python - <<'PY'
+              import json, os, random, time
+              import boto3
+
+              initiales = os.environ["INITIALES"]
+              logs = boto3.client("logs", region_name=os.environ["AWS_REGION"])
+
+              # Chaque "compte" a son profil : la production est calme et
+              # volumineuse, la preproduction bruyante, le developpement
+              # chaotique. C'est ce contraste qui rend le tableau de bord
+              # global lisible.
+              profils = {
+                  "compte-production":    {"lignes": 40, "taux_erreur": 2},
+                  "compte-preproduction": {"lignes": 15, "taux_erreur": 12},
+                  "compte-developpement": {"lignes": 8,  "taux_erreur": 35},
+              }
+              services = ["crm", "provisioning", "mediation", "facturation", "idm"]
+              flux = time.strftime("%Y-%m-%d-%H-%M")
+
+              for compte, profil in profils.items():
+                  groupe = f"/orange/{initiales}/{compte}/bss"
+                  try:
+                      logs.create_log_stream(logGroupName=groupe, logStreamName=flux)
+                  except logs.exceptions.ResourceAlreadyExistsException:
+                      pass
+                  except Exception as exc:
+                      print(f"groupe {groupe} inaccessible : {exc}")
+                      continue
+
+                  evenements = []
+                  base = int(time.time() * 1000) - profil["lignes"] * 1000
+                  for i in range(profil["lignes"]):
+                      en_erreur = random.randint(1, 100) <= profil["taux_erreur"]
+                      evenements.append({
+                          "timestamp": base + i * 1000,
+                          "message": json.dumps({
+                              "compte": compte,
+                              "service": random.choice(services),
+                              "statut": 500 if en_erreur else 200,
+                              "niveau": "ERROR" if en_erreur else "INFO",
+                              "duree_ms": random.randint(20, 3000),
+                              "commande": f"CMD{random.randint(100000, 999999)}",
+                          }),
+                      })
+                  logs.put_log_events(logGroupName=groupe,
+                                      logStreamName=flux,
+                                      logEvents=evenements)
+                  print(f"{groupe} : {len(evenements)} evenements publies")
+              PY
+            resources:
+              requests: {cpu: "50m", memory: "64Mi"}
+              limits: {cpu: "200m", memory: "128Mi"}

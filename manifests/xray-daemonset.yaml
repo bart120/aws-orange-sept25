@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# Demon X-Ray en DaemonSet
+#
+# C'est exactement la mecanique que les equipes d'Orange retrouveront sur
+# leurs clusters : un demon par noeud, qui recoit les segments en UDP sur le
+# port 2000 et les pousse vers X-Ray. Les pods applicatifs ne connaissent que
+# l'adresse IP de leur noeud (status.hostIP), pas le service X-Ray.
+#
+# Les droits d'ecriture viennent du role des noeuds, qui porte
+# AWSXrayWriteOnlyAccess (stack tp-j1-am).
+#
+#   kubectl apply -f xray-daemonset.yaml
+# ---------------------------------------------------------------------------
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xray-daemon
+  namespace: bss
+  labels:
+    app: xray-daemon
+spec:
+  selector:
+    matchLabels:
+      app: xray-daemon
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: xray-daemon
+    spec:
+      # hostNetwork permet aux pods applicatifs d'atteindre le demon via
+      # l'IP de leur propre noeud, sans service intermediaire.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: xray-daemon
+        image: public.ecr.aws/xray/aws-xray-daemon:latest
+        # Pas de "command" : l'image a deja son point d'entree. Le surcharger
+        # avec un chemin errone produit un RunContainerError peu explicite.
+        args:
+        - -o                      # pas de metadonnees EC2 superflues
+        - -b
+        - 0.0.0.0:2000
+        - -n
+        - REMPLACER_REGION
+        - -l
+        - info
+        ports:
+        - containerPort: 2000
+          hostPort: 2000
+          protocol: UDP
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "32Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"

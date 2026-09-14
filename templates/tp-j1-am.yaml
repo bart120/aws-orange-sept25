@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  SOCLE DU LAB - Formation Supervision, Observabilite & Gouvernance sur AWS.
+  Cree le reseau et le cluster EKS qui servent aux six demi-journees.
+  A deployer en premier, au debut du J1 matin, et a conserver jusqu'a la fin du J3.
+  Duree de deploiement mesuree : environ 12 minutes.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Identification
+        Parameters:
+          - Stagiaire
+      - Label:
+          default: Dimensionnement du cluster
+        Parameters:
+          - TypeInstanceNoeud
+          - NombreNoeuds
+    ParameterLabels:
+      Stagiaire:
+        default: Vos initiales (suffixe de toutes les ressources)
+      TypeInstanceNoeud:
+        default: Type d'instance des noeuds
+      NombreNoeuds:
+        default: Nombre de noeuds
+
+Parameters:
+
+  Stagiaire:
+    Type: String
+    Description: >
+      Vos initiales en minuscules, sans espace ni accent. Elles suffixent le nom
+      de toutes les ressources pour que vous retrouviez les votres.
+    AllowedPattern: '^[a-z0-9]{2,8}$'
+    ConstraintDescription: 2 a 8 caracteres, lettres minuscules et chiffres uniquement.
+
+  TypeInstanceNoeud:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: >
+      t3.medium est le bon defaut. t3.small ne tient pas la charge de l'agent
+      CloudWatch et des quatre microservices simultanement.
+
+  NombreNoeuds:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 4
+    Description: >
+      Deux noeuds au minimum : la repartition multi-AZ est l'un des objets
+      pedagogiques du J2 apres-midi.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Reseau
+  # Le compte sandbox n'a aucun VPC par defaut : on cree le notre.
+  # ------------------------------------------------------------------
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-vpc-${Stagiaire}'
+
+  PasserelleInternet:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-igw-${Stagiaire}'
+
+  RattachementPasserelle:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref PasserelleInternet
+
+  SousReseauA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-subnet-a-${Stagiaire}'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  SousReseauB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-subnet-b-${Stagiaire}'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  SousReseauC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.32.0/20
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-subnet-c-${Stagiaire}'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  TableRoutage:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub 'bss-rtb-${Stagiaire}'
+
+  RouteDefaut:
+    Type: AWS::EC2::Route
+    DependsOn: RattachementPasserelle
+    Properties:
+      RouteTableId: !Ref TableRoutage
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref PasserelleInternet
+
+  AssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SousReseauA
+      RouteTableId: !Ref TableRoutage
+
+  AssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SousReseauB
+      RouteTableId: !Ref TableRoutage
+
+  AssociationC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SousReseauC
+      RouteTableId: !Ref TableRoutage
+
+  # ------------------------------------------------------------------
+  # Roles IAM du cluster
+  # ------------------------------------------------------------------
+
+  RoleCluster:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bss-eks-cluster-${Stagiaire}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  RoleNoeuds:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bss-eks-noeuds-${Stagiaire}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        # Indispensable : c'est par ce role que l'agent CloudWatch publie
+        # les metriques Container Insights et les logs des conteneurs.
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # ------------------------------------------------------------------
+  # Cluster EKS
+  # BootstrapClusterCreatorAdminPermissions donne les droits kubectl
+  # au role qui deploie la stack, c'est-a-dire au stagiaire lui-meme.
+  # ------------------------------------------------------------------
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub 'bss-${Stagiaire}'
+      RoleArn: !GetAtt RoleCluster.Arn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref SousReseauA
+          - !Ref SousReseauB
+          - !Ref SousReseauC
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+      Tags:
+        - Key: Formation
+          Value: supervision-aws
+        - Key: Stagiaire
+          Value: !Ref Stagiaire
+
+  GroupeNoeuds:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub 'bss-noeuds-${Stagiaire}'
+      NodeRole: !GetAtt RoleNoeuds.Arn
+      InstanceTypes:
+        - !Ref TypeInstanceNoeud
+      ScalingConfig:
+        MinSize: !Ref NombreNoeuds
+        DesiredSize: !Ref NombreNoeuds
+        MaxSize: 4
+      Subnets:
+        - !Ref SousReseauA
+        - !Ref SousReseauB
+        - !Ref SousReseauC
+      Tags:
+        Formation: supervision-aws
+        Stagiaire: !Ref Stagiaire
+
+  # ------------------------------------------------------------------
+  # Modules complementaires
+  # ------------------------------------------------------------------
+
+  # Necessaire pour les associations d'identite de pod utilisees au J2
+  # apres-midi (acces X-Ray) et au J3 matin (ecriture dans les log groups).
+  ModuleIdentitePod:
+    Type: AWS::EKS::Addon
+    DependsOn: GroupeNoeuds
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  # Installe l'agent CloudWatch et Fluent Bit. C'est lui qui fait remonter
+  # Container Insights et les logs applicatifs des pods sans aucune
+  # configuration supplementaire.
+  ModuleObservabilite:
+    Type: AWS::EKS::Addon
+    DependsOn: GroupeNoeuds
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+
+  # ------------------------------------------------------------------
+  # Prerequis d'execution de la chaine BSS
+  #
+  # Ces ressources appartiennent au socle et non a une demi-journee : la
+  # chaine est deployee des le J1 apres-midi et doit fonctionner tout de
+  # suite. Les placer plus loin ferait tourner les pods en erreur pendant
+  # une demi-journee entiere.
+  # ------------------------------------------------------------------
+
+  FileFacturation:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'bss-facturation-${Stagiaire}'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FileRebut.Arn
+        maxReceiveCount: 3
+
+  FileRebut:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'bss-facturation-rebut-${Stagiaire}'
+      MessageRetentionPeriod: 3600
+
+  # Identite des pods de la chaine, via EKS Pod Identity : plus simple
+  # qu'IRSA, aucun fournisseur OIDC a declarer.
+  RoleChaineBss:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bss-chaine-${Stagiaire}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+      Policies:
+        - PolicyName: acces-file-et-parametres
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt FileFacturation.Arn
+                  - !GetAtt FileRebut.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bss/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  AssociationChaineBss:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: ModuleIdentitePod
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: bss
+      ServiceAccount: bss-chaine
+      RoleArn: !GetAtt RoleChaineBss.Arn
+
+Outputs:
+
+  NomCluster:
+    Description: Nom du cluster EKS
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub '${AWS::StackName}-NomCluster'
+
+  CommandeKubeconfig:
+    Description: >
+      A executer dans CloudShell avant tout kubectl. Copiez-collez cette ligne.
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}'
+
+  IdVpc:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${AWS::StackName}-IdVpc'
+
+  SousReseaux:
+    Value: !Join [',', [!Ref SousReseauA, !Ref SousReseauB, !Ref SousReseauC]]
+    Export:
+      Name: !Sub '${AWS::StackName}-SousReseaux'
+
+  PremierSousReseau:
+    Description: Utilise par les stacks des demi-journees suivantes
+    Value: !Ref SousReseauA
+    Export:
+      Name: !Sub '${AWS::StackName}-PremierSousReseau'
+
+  RoleNoeudsArn:
+    Value: !GetAtt RoleNoeuds.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleNoeudsArn'
+
+  Stagiaire:
+    Value: !Ref Stagiaire
+    Export:
+      Name: !Sub '${AWS::StackName}-Stagiaire'
+
+  GroupeLogsApplicatifs:
+    Description: >
+      Log group ou Fluent Bit depose les logs des conteneurs. Il apparait
+      quelques minutes apres le demarrage des premiers pods.
+    Value: !Sub '/aws/containerinsights/bss-${Stagiaire}/application'
+
+  NomFileFacturation:
+    Description: File asynchrone entre la mediation et la facturation.
+    Value: !GetAtt FileFacturation.QueueName
+    Export:
+      Name: !Sub '${AWS::StackName}-NomFileFacturation'
+
+  UrlFileFacturation:
+    Value: !Ref FileFacturation
+    Export:
+      Name: !Sub '${AWS::StackName}-UrlFileFacturation'

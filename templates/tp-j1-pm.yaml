@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  J1 APRES-MIDI - Centralisation des logs & audit.
+  Cree le decor : bucket de centralisation pret a recevoir CloudTrail, et trois
+  ressources temoins destinees a etre supprimees pour etre retrouvees dans les
+  journaux. Le stagiaire cree lui-meme le trail, les filtres et les alarmes.
+  Duree de deploiement : environ 1 minute.
+
+Parameters:
+
+  StackSocle:
+    Type: String
+    Default: tp-j1-am
+    Description: Nom de la stack socle deployee ce matin.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Bucket de centralisation
+  #
+  # La politique de bucket est fournie : ecrire une politique CloudTrail
+  # correcte n'est pas l'objet du cours et coute vingt minutes en salle.
+  # Le stagiaire cree le trail qui pointe dessus, c'est la ce qu'il apprend.
+  # ------------------------------------------------------------------
+
+  BucketCentralisation:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub
+        - 'bss-journaux-${Suffixe}-${AWS::AccountId}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: purge-fin-de-formation
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Formation
+          Value: supervision-aws
+
+  PolitiqueBucket:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketCentralisation
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailVerifieLesDroits
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt BucketCentralisation.Arn
+          - Sid: CloudTrailEcrit
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${BucketCentralisation.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+          - Sid: ConfigVerifieLesDroits
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt BucketCentralisation.Arn
+          - Sid: ConfigEcrit
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${BucketCentralisation.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # ------------------------------------------------------------------
+  # Ressources temoins
+  #
+  # Elles n'ont aucune utilite fonctionnelle. Leur seule raison d'etre est
+  # d'etre supprimees par le stagiaire pour qu'il retrouve ensuite, dans
+  # CloudTrail, qui a fait quoi et quand. Le fait qu'il soit lui-meme le
+  # coupable rend la demonstration plus parlante qu'un acteur fictif.
+  # ------------------------------------------------------------------
+
+  TemoinGroupeSecurite:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub
+        - 'temoin-a-supprimer-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      GroupDescription: >-
+        Ressource temoin du TP audit. A supprimer pendant le TP, puis a
+        retrouver dans l historique CloudTrail.
+      VpcId: !ImportValue
+        Fn::Sub: '${StackSocle}-IdVpc'
+      Tags:
+        - Key: Name
+          Value: temoin-audit
+        - Key: Role
+          Value: A-SUPPRIMER-PENDANT-LE-TP
+
+  TemoinRubrique:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - 'temoin-a-supprimer-${Suffixe}'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      DisplayName: Ressource temoin du TP audit
+
+  TemoinParametre:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub
+        - '/bss/${Suffixe}/temoin-a-supprimer'
+        - Suffixe: !ImportValue
+            Fn::Sub: '${StackSocle}-Stagiaire'
+      Type: String
+      Value: 'Ressource temoin. Sa suppression laisse une trace dans CloudTrail.'
+      Description: Temoin du TP audit du J1 apres-midi.
+
+
+Outputs:
+
+  NomBucketCentralisation:
+    Description: >
+      Bucket a selectionner lors de la creation du trail CloudTrail.
+      Choisissez "Utiliser un compartiment S3 existant".
+    Value: !Ref BucketCentralisation
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketCentralisation'
+
+  RessourcesTemoins:
+    Description: Les trois ressources a supprimer pendant le TP audit.
+    Value: !Sub
+      - 'SG ${TemoinGroupeSecurite} | Rubrique SNS temoin-a-supprimer-${Suffixe} | Parametre SSM /bss/${Suffixe}/temoin-a-supprimer'
+      - Suffixe: !ImportValue
+          Fn::Sub: '${StackSocle}-Stagiaire'
+
